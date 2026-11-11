@@ -1,0 +1,110 @@
+# Builds the patched PhotoCraft web bundle that the Odoo module `mint_craft_office` serves.
+# Mirrors the `web` job of storytold/craft-common-actions/.github/workflows/release.yml, with the
+# patch from odoo-build.env applied to the upstream tag first. Output: a GitHub release holding
+# photocraft-web-<version>.zip and its .sha256 (mint_craft_office/bundles.txt pins that hash).
+name: Odoo web bundle
+
+on:
+  push:
+    branches: [odoo-build]
+    paths: [odoo-build.env, patches/**, .github/workflows/odoo-build.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      # Upstream at the workspace root, so the shared composite actions find craft-i18n.rev and
+      # put craft-fonts/ where packaging/web/package.sh expects it, exactly as in upstream CI.
+      # This repo (patches + pins) goes in fork/ afterwards; checking out to `.` first would
+      # wipe it.
+      - name: Read pins
+        id: pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/contents/odoo-build.env?ref=$GITHUB_SHA" \
+            -H 'Accept: application/vnd.github.raw' > "$RUNNER_TEMP/odoo-build.env"
+          cat "$RUNNER_TEMP/odoo-build.env"
+          grep -E '^[A-Z_]+=' "$RUNNER_TEMP/odoo-build.env" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if the release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.pins.outputs.RELEASE_TAG }}
+        run: |
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $RELEASE_TAG exists; bump RELEASE_TAG in odoo-build.env"
+            exit 1
+          fi
+
+      - name: Check out storytold/photocraft
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/photocraft
+          ref: ${{ steps.pins.outputs.UPSTREAM_TAG }}
+          persist-credentials: false
+
+      - name: Check out this repo (patches)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+          persist-credentials: false
+
+      - name: Apply patch
+        env:
+          PATCH: fork/${{ steps.pins.outputs.PATCH }}
+        run: |
+          set -euo pipefail
+          git apply --check -v "$PATCH"
+          git apply "$PATCH"
+          git --no-pager diff --stat
+          rm -rf fork
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: odoo-web-photocraft
+      - uses: storytold/craft-common-actions/actions/install-trunk@main
+      - uses: storytold/craft-common-actions/actions/checkout-craft-fonts@main
+        with:
+          ref: ${{ steps.pins.outputs.CRAFT_FONTS_REF }}
+      - uses: storytold/craft-common-actions/actions/checkout-craft-i18n@main
+
+      - name: Build and zip
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          PHOTOCRAFT_BUILD_SHA="$(git rev-parse HEAD)"
+          export PHOTOCRAFT_BUILD_SHA
+          packaging/web/package.sh
+          cd dist/release
+          ls -la
+          for z in photocraft-web-*.zip; do sha256sum "$z" > "$z.sha256"; done
+          cat ./*.sha256
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.pins.outputs.RELEASE_TAG }}
+          UPSTREAM_TAG: ${{ steps.pins.outputs.UPSTREAM_TAG }}
+          PATCH: ${{ steps.pins.outputs.PATCH }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "PhotoCraft $UPSTREAM_TAG web + window.photocraft (for Odoo)" \
+            --notes "storytold/photocraft $UPSTREAM_TAG + $PATCH. Consumed by mint_craft_office (J-Palomino/odoo-custom-modules)." \
+            dist/release/photocraft-web-*.zip dist/release/photocraft-web-*.zip.sha256
